@@ -1,0 +1,225 @@
+version: "3.9"
+
+networks:
+  idp-net:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  timescale-data:
+  redis-data:
+  grafana-data:
+  prometheus-data:
+  loki-data:
+
+
+services:
+
+  # ── Control Plane ────────────────────────────────────────────────
+  control-plane:
+    build:
+      context: ./control-plane
+      dockerfile: Dockerfile
+      target: development
+    image: idp/control-plane:dev
+    container_name: idp-control-plane
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+      - "2345:2345" # Delve debugger
+    environment:
+      - APP_ENV=development
+      - LOG_LEVEL=debug
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=idp
+      - DB_PASSWORD=idppassword
+      - DB_NAME=idp
+      - REDIS_URL=redis://redis:6379
+      - ML_ENGINE_URL=http://ml-cost-engine:8000
+      - K8S_IN_CLUSTER=false
+      - KUBECONFIG=/root/.kube/config
+      - JWT_SECRET=dev-secret-change-in-prod
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+    volumes:
+      - ~/.kube:/root/.kube:ro
+      - ./control-plane:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - idp-net
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8080/health" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── ML Cost Engine ───────────────────────────────────────────────
+  ml-cost-engine:
+    build:
+      context: ./ml-cost-engine
+      dockerfile: Dockerfile
+      target: development
+    image: idp/ml-cost-engine:dev
+    container_name: idp-ml-engine
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - APP_ENV=development
+      - LOG_LEVEL=debug
+      - DB_URL=postgresql://idp:idppassword@timescaledb:5432/idp_metrics
+      - REDIS_URL=redis://redis:6379
+      - MODEL_PATH=/app/models
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+    volumes:
+      - ./ml-cost-engine/src:/app/src
+      - ./ml-cost-engine/models:/app/models
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    networks:
+      - idp-net
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/health" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── PostgreSQL ───────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: idp-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=idp
+      - POSTGRES_PASSWORD=idppassword
+      - POSTGRES_DB=idp
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infra/docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    networks:
+      - idp-net
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U idp" ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── TimescaleDB (metrics) ────────────────────────────────────────
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: idp-timescaledb
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=idp
+      - POSTGRES_PASSWORD=idppassword
+      - POSTGRES_DB=idp_metrics
+    volumes:
+      - timescale-data:/var/lib/postgresql/data
+      - ./infra/docker/timescaledb/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5433:5432"
+    networks:
+      - idp-net
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U idp -d idp_metrics" ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── Redis ────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: idp-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - idp-net
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── OpenTelemetry Collector ───────────────────────────────────────
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    container_name: idp-otel
+    restart: unless-stopped
+    command: [ "--config=/etc/otel/config.yaml" ]
+    volumes:
+      - ./infra/docker/otel/config.yaml:/etc/otel/config.yaml
+    ports:
+      - "4317:4317" # gRPC
+      - "4318:4318" # HTTP
+      - "8888:8888" # Prometheus metrics
+    networks:
+      - idp-net
+
+  # ── Grafana ──────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:latest
+    container_name: idp-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./infra/docker/grafana/provisioning:/etc/grafana/provisioning
+      - ./infra/docker/grafana/dashboards:/var/lib/grafana/dashboards
+    networks:
+      - idp-net
+
+  # ── Prometheus / VictoriaMetrics ─────────────────────────────────
+  victoriametrics:
+    image: victoriametrics/victoria-metrics:latest
+    container_name: idp-victoriametrics
+    restart: unless-stopped
+    ports:
+      - "8428:8428"
+    volumes:
+      - prometheus-data:/victoria-metrics-data
+    command:
+      - "--storageDataPath=/victoria-metrics-data"
+      - "--retentionPeriod=30d"
+    networks:
+      - idp-net
+
+  # ── Loki ─────────────────────────────────────────────────────────
+  loki:
+    image: grafana/loki:latest
+    container_name: idp-loki
+    restart: unless-stopped
+    ports:
+      - "3100:3100"
+    volumes:
+      - loki-data:/loki
+      - ./infra/docker/loki/config.yaml:/etc/loki/config.yaml
+    command: -config.file=/etc/loki/config.yaml
+    networks:
+      - idp-net
+
+  # ── Jaeger (Traces) ──────────────────────────────────────────────
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: idp-jaeger
+    restart: unless-stopped
+    ports:
+      - "16686:16686" # UI
+      - "14268:14268" # HTTP collector
+    networks:
+      - idp-net

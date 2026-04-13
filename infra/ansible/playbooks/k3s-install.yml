@@ -1,0 +1,165 @@
+---
+- name: Prepare all nodes
+  hosts: all
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Update APT cache
+      apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install required packages
+      apt:
+        name:
+          - curl
+          - ca-certificates
+          - apt-transport-https
+          - gnupg
+          - lsb-release
+          - fail2ban
+          - ufw
+          - auditd
+        state: present
+
+    - name: Set hostname
+      hostname:
+        name: "{{ inventory_hostname }}"
+
+    - name: Configure sysctl for k8s
+      sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        state: present
+        reload: true
+      loop:
+        - { key: "net.ipv4.ip_forward", value: "1" }
+        - { key: "net.bridge.bridge-nf-call-iptables", value: "1" }
+        - { key: "net.bridge.bridge-nf-call-ip6tables", value: "1" }
+        - { key: "kernel.dmesg_restrict", value: "1" }
+        - { key: "net.ipv4.conf.all.send_redirects", value: "0" }
+        - { key: "net.ipv4.conf.all.accept_redirects", value: "0" }
+        - { key: "vm.swappiness", value: "0" }
+
+    - name: Disable swap
+      command: swapoff -a
+      when: ansible_swaptotal_mb > 0
+
+    - name: Remove swap from fstab
+      lineinfile:
+        path: /etc/fstab
+        regexp: '^.*swap.*$'
+        state: absent
+
+    - name: Load kernel modules
+      modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - overlay
+        - br_netfilter
+
+    - name: Persist kernel modules
+      copy:
+        dest: /etc/modules-load.d/k3s.conf
+        content: |
+          overlay
+          br_netfilter
+
+    - name: Configure UFW — allow SSH
+      ufw:
+        rule: allow
+        port: "22"
+        proto: tcp
+
+    - name: Configure UFW — allow K3s API
+      ufw:
+        rule: allow
+        port: "6443"
+        proto: tcp
+
+    - name: Configure UFW — allow K3s Flannel
+      ufw:
+        rule: allow
+        port: "8472"
+        proto: udp
+
+    - name: Enable UFW
+      ufw:
+        state: enabled
+        policy: deny
+
+- name: Install K3s server
+  hosts: k3s_servers
+  become: true
+  vars:
+    k3s_version: "v1.29.3+k3s1"
+
+  tasks:
+    - name: Install K3s server
+      shell: |
+        curl -sfL https://get.k3s.io | \
+        INSTALL_K3S_VERSION="{{ k3s_version }}" \
+        INSTALL_K3S_EXEC="server \
+          --disable traefik \
+          --disable servicelb \
+          --write-kubeconfig-mode 644 \
+          --kube-apiserver-arg=audit-log-path=/var/log/k8s-audit.log \
+          --kube-apiserver-arg=audit-log-maxage=30 \
+          --kube-apiserver-arg=audit-log-maxbackup=10 \
+          --kube-apiserver-arg=audit-log-maxsize=100" \
+        sh -
+      args:
+        creates: /usr/local/bin/k3s
+
+    - name: Wait for K3s to be ready
+      wait_for:
+        path: /etc/rancher/k3s/k3s.yaml
+        timeout: 120
+
+    - name: Enable and start K3s
+      systemd:
+        name: k3s
+        state: started
+        enabled: true
+
+    - name: Read node token
+      slurp:
+        src: /var/lib/rancher/k3s/server/node-token
+      register: node_token
+
+    - name: Set token fact
+      set_fact:
+        k3s_token: "{{ node_token.content | b64decode | trim }}"
+
+    - name: Copy kubeconfig locally
+      fetch:
+        src: /etc/rancher/k3s/k3s.yaml
+        dest: "{{ playbook_dir }}/../../../kubeconfig-dev.yaml"
+        flat: true
+
+- name: Install K3s agents
+  hosts: k3s_agents
+  become: true
+  vars:
+    k3s_version: "v1.29.3+k3s1"
+    k3s_url: "https://{{ hostvars[groups['k3s_servers'][0]]['ansible_host'] }}:6443"
+    k3s_token: "{{ hostvars[groups['k3s_servers'][0]]['k3s_token'] }}"
+
+  tasks:
+    - name: Install K3s agent
+      shell: |
+        curl -sfL https://get.k3s.io | \
+        INSTALL_K3S_VERSION="{{ k3s_version }}" \
+        K3S_URL="{{ k3s_url }}" \
+        K3S_TOKEN="{{ k3s_token }}" \
+        sh -
+      args:
+        creates: /usr/local/bin/k3s
+
+    - name: Enable and start K3s agent
+      systemd:
+        name: k3s-agent
+        state: started
+        enabled: true

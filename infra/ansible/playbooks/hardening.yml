@@ -1,0 +1,95 @@
+---
+- name: System Hardening
+  hosts: all
+  become: true
+
+  tasks:
+    - name: Configure fail2ban
+      copy:
+        dest: /etc/fail2ban/jail.local
+        content: |
+          [DEFAULT]
+          bantime  = 1h
+          findtime = 10m
+          maxretry = 5
+
+          [sshd]
+          enabled = true
+          port    = ssh
+          logpath = %(sshd_log)s
+          backend = %(sshd_backend)s
+      notify: restart fail2ban
+
+    - name: SSH hardening
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        state: present
+      loop:
+        - { regexp: "^#?PermitRootLogin", line: "PermitRootLogin no" }
+        - { regexp: "^#?PasswordAuthentication", line: "PasswordAuthentication no" }
+        - { regexp: "^#?X11Forwarding", line: "X11Forwarding no" }
+        - { regexp: "^#?MaxAuthTries", line: "MaxAuthTries 3" }
+        - { regexp: "^#?ClientAliveInterval", line: "ClientAliveInterval 300" }
+        - { regexp: "^#?ClientAliveCountMax", line: "ClientAliveCountMax 2" }
+      notify: restart sshd
+
+    - name: Configure audit rules
+      copy:
+        dest: /etc/audit/rules.d/idp-hardening.rules
+        content: |
+          # Delete all existing rules
+          -D
+          # Set buffer size
+          -b 8192
+          # Monitor kubectl and k3s
+          -w /usr/local/bin/kubectl -p x -k kubectl
+          -w /usr/local/bin/k3s -p x -k k3s
+          # Monitor sudoers
+          -w /etc/sudoers -p wa -k sudoers
+          # Monitor passwd
+          -w /etc/passwd -p wa -k identity
+          # Monitor group
+          -w /etc/group -p wa -k identity
+          # Monitor SSH keys
+          -w /root/.ssh -p wa -k auth
+          # Monitor system calls
+          -a always,exit -F arch=b64 -S mount -k mount
+          -a always,exit -F arch=b64 -S unlink -k delete
+      notify: restart auditd
+
+    - name: Set login.defs hardening
+      lineinfile:
+        path: /etc/login.defs
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+      loop:
+        - { regexp: "^PASS_MAX_DAYS", line: "PASS_MAX_DAYS 90" }
+        - { regexp: "^PASS_MIN_DAYS", line: "PASS_MIN_DAYS 7" }
+        - { regexp: "^PASS_WARN_AGE", line: "PASS_WARN_AGE 14" }
+
+    - name: Install rkhunter
+      apt:
+        name: rkhunter
+        state: present
+
+    - name: Update rkhunter database
+      command: rkhunter --update
+      ignore_errors: true
+
+  handlers:
+    - name: restart fail2ban
+      systemd:
+        name: fail2ban
+        state: restarted
+
+    - name: restart sshd
+      systemd:
+        name: sshd
+        state: restarted
+
+    - name: restart auditd
+      systemd:
+        name: auditd
+        state: restarted

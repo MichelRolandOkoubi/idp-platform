@@ -1,0 +1,71 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ml-cost-engine
+  namespace: idp-system
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ml-cost-engine
+  template:
+    metadata:
+      labels:
+        app: ml-cost-engine
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: ml-cost-engine
+          image: ghcr.io/your-org/idp-platform/ml-cost-engine:latest
+          ports:
+            - containerPort: 8000
+          env:
+            - name: APP_ENV
+              value: production
+            - name: MODEL_PATH
+              value: /app/models
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://otel-collector:4317"
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 20
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          volumeMounts:
+            - name: models
+              mountPath: /app/models
+              readOnly: true
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+      volumes:
+        - name: models
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ml-cost-engine
+  namespace: idp-system
+spec:
+  selector:
+    app: ml-cost-engine
+  ports:
+    - port: 8000
+      targetPort: 8000

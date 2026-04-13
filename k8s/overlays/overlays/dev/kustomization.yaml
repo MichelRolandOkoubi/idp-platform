@@ -1,0 +1,17 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+bases:
+  - ../../base
+
+namePrefix: dev-
+
+patchesStrategicMerge:
+  - patches/replicas.yaml
+  - patches/resources.yaml
+
+images:
+  - name: ghcr.io/your-org/idp-platform/control-plane
+    newTag: dev
+  - name: ghcr.io/your-org/idp-platform/ml-cost-engine
+    newTag: dev
